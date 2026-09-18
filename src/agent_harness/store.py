@@ -146,6 +146,16 @@ class SQLiteStore:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(task_id, step)
                 );
+                CREATE TABLE IF NOT EXISTS memories (
+                    id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    memory_key TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    source_task_id TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(namespace, memory_key, source_task_id)
+                );
                 """
             )
 
@@ -238,13 +248,22 @@ class SQLiteStore:
             return bool(cursor.rowcount)
 
     def finish_task(self, task_id: str, output: dict[str, Any]) -> None:
-        with self.transaction() as conn:
-            row = conn.execute("SELECT workflow_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        with self.transaction(immediate=True) as conn:
+            row = conn.execute(
+                "SELECT workflow_id, status, output_json FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            encoded = dumps(output)
+            if row["status"] == TaskStatus.SUCCEEDED:
+                if row["output_json"] == encoded:
+                    return
+                raise ValueError(f"task {task_id} already succeeded with different output")
             conn.execute(
                 "UPDATE tasks SET status=?, output_json=?, error=NULL, updated_at=? WHERE id=?",
-                (TaskStatus.SUCCEEDED, dumps(output), utc_now(), task_id),
+                (TaskStatus.SUCCEEDED, encoded, utc_now(), task_id),
             )
-            self._append_event(conn, row[0], task_id, "task.succeeded", {"output": output})
+            self._append_event(conn, row["workflow_id"], task_id, "task.succeeded", {"output": output})
 
     def fail_task(self, task_id: str, error: str, *, retryable: bool) -> None:
         with self.transaction() as conn:
@@ -259,13 +278,17 @@ class SQLiteStore:
             self._append_event(conn, row[0], task_id, "task.failed", {"error": error, "retryable": retryable})
 
     def wait_task_for_approval(self, task_id: str) -> None:
-        with self.transaction() as conn:
-            row = conn.execute("SELECT workflow_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        with self.transaction(immediate=True) as conn:
+            row = conn.execute("SELECT workflow_id, status FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            if row["status"] == TaskStatus.WAITING_APPROVAL:
+                return
             conn.execute(
                 "UPDATE tasks SET status=?, updated_at=? WHERE id=?",
                 (TaskStatus.WAITING_APPROVAL, utc_now(), task_id),
             )
-            self._append_event(conn, row[0], task_id, "task.waiting_approval", {})
+            self._append_event(conn, row["workflow_id"], task_id, "task.waiting_approval", {})
 
     def resume_approved_tasks(self, workflow_id: str) -> int:
         with self.transaction() as conn:
@@ -353,6 +376,35 @@ class SQLiteStore:
                 "SELECT turn_json FROM agent_steps WHERE task_id=? AND step=?", (task_id, step)
             ).fetchone()
         return json.loads(row[0]) if row else None
+
+    def put_memory(
+        self,
+        *,
+        namespace: str,
+        memory_key: str,
+        content: str,
+        source_task_id: str,
+        confidence: float,
+    ) -> str:
+        digest = uuid.uuid5(
+            uuid.NAMESPACE_URL, f"{namespace}:{memory_key}:{source_task_id}"
+        ).hex[:16]
+        memory_id = f"memory_{digest}"
+        with self.transaction(immediate=True) as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO memories
+                (id, namespace, memory_key, content, source_task_id, confidence, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (memory_id, namespace, memory_key, content, source_task_id, confidence, utc_now()),
+            )
+        return memory_id
+
+    def list_memories(self, namespace: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM memories WHERE namespace=? ORDER BY created_at", (namespace,)
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def decide_approval(self, approval_id: str, approved: bool, actor: str, note: str = "") -> None:
         with self.transaction(immediate=True) as conn:

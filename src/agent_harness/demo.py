@@ -65,3 +65,20 @@ def build_example_gateway(store: SQLiteStore) -> ToolGateway:
         handler=lambda args: {"message_id": f"msg_{uuid.uuid4().hex[:8]}", "text": args["text"]},
     ))
     return ToolGateway(store, registry)
+
+
+def build_langgraph_demo_components(store: SQLiteStore):
+    from .langgraph_runtime import ScriptedModel
+
+    gateway = build_example_gateway(store)
+    models = {
+        "analyst": ScriptedModel("analyst", "repo.search"),
+        "backend": ScriptedModel("backend", "issue.label"),
+        "tester": ScriptedModel("tester"),
+    }
+    prompts = {
+        "analyst": "你是影响分析 Agent。所有结论必须引用可追踪证据。",
+        "backend": "你是后端开发 Agent。输出必须满足依赖任务的验收标准。",
+        "tester": "你是测试验证 Agent。只根据可观察结果给出结论。",
+    }
+    return gateway, models, prompts

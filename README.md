@@ -1,6 +1,6 @@
 # Resumable Multi-Agent Harness
 
-一个面向代码影响分析、方案设计与测试验证的轻量多 Agent 编排内核。它刻意不把 LangGraph 作为核心依赖，用少量可读代码展示简历中真正关键的工程机制：持久化状态机、DAG 调度、工具副作用治理、调用级 Checkpoint 与分层上下文。
+一个面向代码影响分析、方案设计与测试验证的多 Agent 编排内核。项目同时提供自研轻量 Orchestrator 和 LangGraph 两层执行图，底层共享同一套工具安全、业务状态与审计机制。
 
 ## 架构
 
@@ -24,6 +24,18 @@ Agent tool request ──> permission ──> checkpoint/claim ──> local or 
 All state ───────────────────────────────> SQLite + event log
 ```
 
+LangGraph 版本采用两层结构：
+
+```text
+Workflow Graph
+  validate_plan -> schedule -> role_agent subgraph -> collect -> schedule
+
+Role Agent Subgraph
+  retrieve_context -> compact/assemble -> llm -> validate
+      -> policy -> approval(interrupt) -> tool -> loop
+      -> verify -> extract_memory -> commit_memory -> finalize
+```
+
 ## 已实现能力
 
 - 按 `analyst / backend / tester` 角色拆分 DAG 子任务，依赖满足后才可执行。
@@ -35,6 +47,8 @@ All state ───────────────────────�
 - 租约实现原子抢占；非幂等调用结果不确定时拒绝盲目重试。
 - 上下文按系统约束、当前任务、依赖输出、产物索引、近期轨迹、历史摘要分层，并按预算裁剪。
 - OpenAI / Anthropic 文本适配器、OpenAI function calling 适配器，以及无需 API Key 的确定性 Demo Agent。
+- LangGraph 父图、可复用角色子图、SQLite Checkpointer 和 Human-in-the-loop interrupt。
+- 每个角色独立工具白名单；LLM 输出与 ToolGateway 边界均执行 JSON Schema 参数校验。
 
 ## 快速开始
 
@@ -44,7 +58,11 @@ python -m venv .venv
 pip install -e ".[dev]"
 pytest -q
 agent-harness --db demo.db demo
+agent-harness --db graph-demo.db langgraph-demo
 ```
+
+LangGraph Demo 会使用独立的 `graph-demo.db.checkpoints` 保存图状态；业务状态仍保存在
+`graph-demo.db`。两者分别承担执行恢复和业务事实记录。
 
 查看持久化状态：
 
@@ -69,9 +87,11 @@ agent-harness --db demo.db approve <approval_id> --actor reviewer
 5. 本地或 MCP 调用完成后写入结果与审计事件。
 6. 非幂等调用若在执行中失联，标记为 `uncertain`，要求人工对账，而不是重试。
 
-### 是否需要 LangGraph
+### LangGraph 与 Harness 的边界
 
-不需要。Harness 关注的是执行语义和安全边界，LangGraph 是一种图编排实现。这个项目自己实现核心层更适合用于面试展示；若生产团队已经使用 LangGraph，可把它放在外层：节点调用这里的 Agent/ToolGateway，checkpoint 仍以本项目的调用账本为最终事实来源。不要同时维护两套相互竞争的任务状态机。
+LangGraph 负责节点编排、图状态 Checkpoint、条件路由和人工中断。Harness Store 负责任务、审批、产物、长期记忆和工具副作用账本。工具节点只能调用 `ToolGateway`，不能直接访问本地或 MCP handler。详细设计见 [`docs/langgraph-design.md`](docs/langgraph-design.md)。
+
+当前 SQLite 版本为了保证演示语义清晰，父图按 DAG 就绪顺序串行调度；生产环境切换到 Postgres 后，可将同一批无依赖冲突的任务通过 `Send` 扇出，并使用独立子图 namespace 和确定性 reducer 汇总结果。
 
 ## 下一步可扩展
 

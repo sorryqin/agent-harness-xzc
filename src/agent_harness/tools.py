@@ -7,6 +7,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
+from jsonschema import validate as validate_json_schema
+
 from .domain import (
     ApprovalRequired, CallConflictError, RiskLevel, ToolCallStatus, UnsafeRetryError,
 )
@@ -89,6 +91,34 @@ class ToolGateway:
         encoded = dumps(arguments).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    def authorization_status(
+        self,
+        *,
+        session_id: str,
+        workflow_id: str,
+        task_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        purpose: str,
+        call_id: str,
+    ) -> dict[str, str | None]:
+        """Prepare an approval without executing the tool.
+
+        This is safe to call again when a LangGraph interrupt re-enters a node.
+        """
+        spec = self.registry.get(tool_name)
+        validate_json_schema(instance=arguments, schema=spec.input_schema)
+        fingerprint = self.fingerprint(arguments)
+        try:
+            self._authorize_or_request(
+                spec, session_id, workflow_id, task_id, call_id, fingerprint, arguments, purpose
+            )
+            return {"status": "approved", "approval_id": None}
+        except ApprovalRequired as exc:
+            return {"status": "pending", "approval_id": exc.approval_id}
+        except PermissionError:
+            return {"status": "rejected", "approval_id": f"approval_{call_id}"}
+
     def execute(
         self,
         *,
@@ -101,6 +131,7 @@ class ToolGateway:
         call_id: str,
     ) -> Any:
         spec = self.registry.get(tool_name)
+        validate_json_schema(instance=arguments, schema=spec.input_schema)
         fingerprint = self.fingerprint(arguments)
 
         # Authorization is deliberately evaluated before any handler/MCP side effect.
