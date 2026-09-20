@@ -49,6 +49,7 @@ Role Agent Subgraph
 - OpenAI / Anthropic 文本适配器、OpenAI function calling 适配器，以及无需 API Key 的确定性 Demo Agent。
 - LangGraph 父图、可复用角色子图、SQLite Checkpointer 和 Human-in-the-loop interrupt。
 - 每个角色独立工具白名单；LLM 输出与 ToolGateway 边界均执行 JSON Schema 参数校验。
+- 工具调用支持可配置超时（`ToolSpec.timeout_seconds`），慢调用自动失败并记录审计事件。
 
 ## 快速开始
 

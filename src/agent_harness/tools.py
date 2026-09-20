@@ -4,6 +4,7 @@ import hashlib
 import json
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
@@ -147,14 +148,40 @@ class ToolGateway:
             return replay
 
         try:
+            executor = ThreadPoolExecutor(max_workers=1)
             if spec.handler is not None:
-                result = spec.handler(arguments)
+                future = executor.submit(spec.handler, arguments)
             else:
                 if self.mcp_client is None:
+                    executor.shutdown(wait=False)
                     raise RuntimeError(f"MCP client is not configured for {spec.name}")
-                result = self.mcp_client.call_tool(spec.mcp_server or "", spec.name, arguments)
+                future = executor.submit(
+                    self.mcp_client.call_tool, spec.mcp_server or "", spec.name, arguments
+                )
+
+            try:
+                result = future.result(timeout=spec.timeout_seconds)
+            except FuturesTimeoutError:
+                error_msg = (
+                    f"tool call {call_id} timed out after {spec.timeout_seconds}s "
+                    f"(tool={spec.name}, task={task_id})"
+                )
+                self._record_failure(call_id, workflow_id, task_id, spec.risk, error_msg)
+                self.store.append_event(
+                    workflow_id, task_id, "tool.timeout",
+                    {
+                        "call_id": call_id,
+                        "tool": spec.name,
+                        "timeout": spec.timeout_seconds,
+                        "task_id": task_id,
+                    },
+                )
+                executor.shutdown(wait=False)
+                raise TimeoutError(error_msg) from None
+            executor.shutdown(wait=True)
         except Exception as exc:
-            self._record_failure(call_id, workflow_id, task_id, spec.risk, str(exc))
+            if not isinstance(exc, TimeoutError):
+                self._record_failure(call_id, workflow_id, task_id, spec.risk, str(exc))
             raise
         return self._record_success(call_id, workflow_id, task_id, spec, result)
 

@@ -164,3 +164,104 @@ def test_lost_lease_on_non_idempotent_call_is_surfaced_not_overwritten(tmp_path)
     with store.transaction() as conn:
         row = conn.execute("SELECT status FROM tool_calls WHERE call_id='send'").fetchone()
     assert row["status"] == "running"  # untouched by the worker that lost the lease
+
+
+def test_tool_timeout_is_enforced(tmp_path):
+    """Handler that exceeds timeout_seconds is aborted with TimeoutError."""
+    def slow_handler(args):
+        time.sleep(2)  # Exceeds timeout
+        return {"result": "should not reach here"}
+
+    store = SQLiteStore(tmp_path / "state.db")
+    workflow_id = store.create_workflow("test timeout")
+    registry = ToolRegistry()
+    registry.register(ToolSpec("slow_tool", "slow tool", RiskLevel.READ_ONLY,
+                               handler=slow_handler, timeout_seconds=0.5))
+    gateway = ToolGateway(store, registry)
+
+    kwargs = dict(session_id=store.session_id(workflow_id), workflow_id=workflow_id,
+                  task_id="task-1", tool_name="slow_tool", arguments={},
+                  purpose="test timeout", call_id="call-timeout-1")
+
+    start = time.time()
+    with pytest.raises(TimeoutError, match="timed out after 0.5s"):
+        gateway.execute(**kwargs)
+    elapsed = time.time() - start
+
+    # Should timeout quickly, not wait full 2s
+    assert elapsed < 1.0, f"Timeout took too long: {elapsed}s"
+
+    # Verify tool call state is recorded as failed
+    with store._connect() as conn:
+        row = conn.execute("SELECT * FROM tool_calls WHERE call_id=?", ("call-timeout-1",)).fetchone()
+    assert row is not None
+    assert row["status"] == "failed"
+    assert "timed out after 0.5s" in (row["error"] or "")
+
+    # Verify timeout event was logged
+    with store._connect() as conn:
+        event = conn.execute(
+            "SELECT * FROM events WHERE event_type='tool.timeout' AND payload_json LIKE ?",
+            (f'%"call_id":"call-timeout-1"%',)
+        ).fetchone()
+    assert event is not None
+    assert "slow_tool" in event["payload_json"]
+
+
+def test_tool_completes_within_timeout(tmp_path):
+    """Handler that completes within timeout_seconds succeeds normally."""
+    def fast_handler(args):
+        time.sleep(0.05)
+        return {"status": "ok"}
+
+    store = SQLiteStore(tmp_path / "state.db")
+    workflow_id = store.create_workflow("test no timeout")
+    registry = ToolRegistry()
+    registry.register(ToolSpec("fast_tool", "fast tool", RiskLevel.READ_ONLY,
+                               handler=fast_handler, timeout_seconds=2.0))
+    gateway = ToolGateway(store, registry)
+
+    kwargs = dict(session_id=store.session_id(workflow_id), workflow_id=workflow_id,
+                  task_id="task-2", tool_name="fast_tool", arguments={},
+                  purpose="test success", call_id="call-fast-1")
+
+    result = gateway.execute(**kwargs)
+    assert result == {"status": "ok"}
+
+    # Verify tool call state is succeeded
+    with store._connect() as conn:
+        row = conn.execute("SELECT * FROM tool_calls WHERE call_id=?", ("call-fast-1",)).fetchone()
+    assert row is not None
+    assert row["status"] == "succeeded"
+    assert row["error"] is None
+
+
+def test_mcp_tool_timeout(tmp_path):
+    """MCP tool that exceeds timeout_seconds is aborted with TimeoutError."""
+    class SlowMCPClient:
+        def call_tool(self, server, name, arguments):
+            time.sleep(3)
+            return {"result": "too late"}
+
+    store = SQLiteStore(tmp_path / "state.db")
+    workflow_id = store.create_workflow("test mcp timeout")
+    registry = ToolRegistry()
+    registry.register(ToolSpec("mcp_slow", "slow MCP tool", RiskLevel.READ_ONLY,
+                               mcp_server="test_server", timeout_seconds=0.5))
+    gateway = ToolGateway(store, registry, mcp_client=SlowMCPClient())
+
+    kwargs = dict(session_id=store.session_id(workflow_id), workflow_id=workflow_id,
+                  task_id="task-3", tool_name="mcp_slow", arguments={},
+                  purpose="test mcp timeout", call_id="call-mcp-timeout-1")
+
+    start = time.time()
+    with pytest.raises(TimeoutError, match="timed out after 0.5s"):
+        gateway.execute(**kwargs)
+    elapsed = time.time() - start
+
+    assert elapsed < 1.0, f"MCP timeout took too long: {elapsed}s"
+
+    with store._connect() as conn:
+        row = conn.execute("SELECT * FROM tool_calls WHERE call_id=?", ("call-mcp-timeout-1",)).fetchone()
+    assert row is not None
+    assert row["status"] == "failed"
